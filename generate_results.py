@@ -5,6 +5,7 @@ import os
 import pdb
 import time
 import json
+import open3d as o3d
 
 import rospy
 import yaml
@@ -30,7 +31,7 @@ from Data.KittiOdometry import KittiOdomDataset
 import time
 
 # MODEL_NAME = "ConvBKI_Single"
-MODEL_NAME = "ConvBKI_Single_02_odom"
+MODEL_NAME = "ConvBKI_PerClass_Compound"
 
 print("Model is:", MODEL_NAME)
 
@@ -103,23 +104,55 @@ dataloader_test = DataLoader(test_ds, batch_size=1, shuffle=False, collate_fn=te
 
 
 # Create map object
+MEAS_RESULT = False
 grid_params = model_params["test"]["grid_params"]
+model_params["map_method"] = "local"
+if model_params["map_method"] == "global":
+    map_object = GlobalMap(
+        torch.tensor([int(p) for p in grid_params['grid_size']], dtype=torch.long).to(device),  # Grid size
+        torch.tensor(grid_params['min_bound']).to(device),  # Lower bound
+        torch.tensor(grid_params['max_bound']).to(device),  # Upper bound
+        torch.load(os.path.join("Models", "Weights", LOAD_DIR, "filters" + str(LOAD_EPOCH) + ".pt")), # Filters
+        model_params["filter_size"], # Filter size
+        num_classes=NUM_CLASSES,
+        ignore_labels = ignore_labels, # Classes
+        device=device # Device
+    )
 
-map_object = GlobalMap(
-    torch.tensor([int(p) for p in grid_params['grid_size']], dtype=torch.long).to(device),  # Grid size
-    torch.tensor(grid_params['min_bound']).to(device),  # Lower bound
-    torch.tensor(grid_params['max_bound']).to(device),  # Upper bound
-    torch.load(os.path.join("Models", "Weights", LOAD_DIR, "filters" + str(LOAD_EPOCH) + ".pt")), # Filters
-    model_params["filter_size"], # Filter size
-    num_classes=NUM_CLASSES,
-    ignore_labels = ignore_labels, # Classes
-    device=device # Device
-)
+elif model_params["map_method"] == "local":
+    map_object = LocalMap(
+        torch.tensor([int(p) for p in grid_params['grid_size']], dtype=torch.long).to(device),  # Grid size
+        torch.tensor(grid_params['min_bound']).to(device),  # Lower bound
+        torch.tensor(grid_params['max_bound']).to(device),  # Upper bound
+        torch.load(os.path.join("Models", "Weights", LOAD_DIR, "filters" + str(LOAD_EPOCH) + ".pt")), # Filters
+        model_params["filter_size"], # Filter size
+        num_classes=NUM_CLASSES,
+        ignore_labels = ignore_labels, # Classes
+        device=device # Device
+    )
+
+
 
 if VISUALIZE:
-    rospy.init_node('talker', anonymous=True)
-    map_pub = rospy.Publisher('SemMap_global', MarkerArray, queue_size=10)
-    next_map = MarkerArray()
+    if model_params["map_method"] == "global":
+        rospy.init_node('talker', anonymous=True)
+        map_pub = rospy.Publisher('SemMap_global', MarkerArray, queue_size=10)
+        next_map = MarkerArray()
+    else:
+
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(
+            window_name='Segmented Scene',
+            width=2000,
+            height=1000,
+            left=480,
+            top=270)
+        vis.get_render_option().show_coordinate_frame = True
+        vis.get_render_option().background_color = [0.0, 0.0, 0.0]
+        vis.get_render_option().point_size = 5
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector()
+        vis.add_geometry(pcd)
 
 if GEN_PREDS:
     if not os.path.exists(MODEL_NAME):
@@ -137,12 +170,13 @@ total_un_bki = torch.zeros(map_object.num_classes, device=device)
 total_un_seg = torch.zeros(map_object.num_classes, device=device)
 
 total_t = 0.0
+pc_prev = 2
 for idx in range(len(test_ds)):
     with torch.no_grad():
         # Load data
         pose, points, pred_labels, gt_labels, scene_id, frame_id = test_ds.get_test_item(idx, get_gt=MEAS_RESULT)
         
-        if VISUALIZE and MEAS_RESULT:
+        if VISUALIZE and MEAS_RESULT and model_params["map_method"] == "global":
             if dataset == "semantic_kitti":
                 not_void = (gt_labels != 0)[:, 0]
                 points = points[not_void, :]
@@ -156,37 +190,53 @@ for idx in range(len(test_ds)):
         if scene_id != current_scene or (frame_id - 1) != current_frame_id:
             print(scene_id, frame_id)
             map_object.reset_grid()
+
             if GEN_PREDS:
                 seq_dir = os.path.join(MODEL_NAME, "sequences", str(scene_id).zfill(2), "predictions")
                 frame_num = 0
                 if not os.path.exists(seq_dir):
                     os.makedirs(seq_dir)
         # Update pose if not
-        start_t = time.time()
-        map_object.propagate(pose)
+        # start_t = time.time()
 
-        # Add points to map
         labeled_pc = np.hstack((points, pred_labels))
         labeled_pc_torch = torch.from_numpy(labeled_pc).to(device=device)
-        map_object.update_map(labeled_pc_torch)
-        total_t += time.time() - start_t
-        # print(total_t/(frame_num+1))
+
+        if model_params["map_method"] == "local":
+            map_object.propup(torch.from_numpy(pose).to(device=device), labeled_pc_torch)
+        else:
+            map_object.propagate(pose)
+            map_object.update_map(labeled_pc_torch)
+
 
         current_scene = scene_id
         current_frame_id = frame_id
 
         if VISUALIZE:
-            if rospy.is_shutdown():
-                exit("Closing Python")
-            try:
-                if MAP_METHOD == "global" or MAP_METHOD == "local":
-                    map = publish_voxels(map_object, grid_params['min_bound'], grid_params['max_bound'], grid_params['grid_size'], colors, next_map)
-                    map_pub.publish(map)
-                elif MAP_METHOD == "local":
-                    map = publish_local_map(map_object.local_map, map_object.centroids, grid_params, colors, next_map)
-                    map_pub.publish(map)
-            except:
-                exit("Publishing broke")
+            if model_params["map_method"] == "global":
+                if rospy.is_shutdown():
+                    exit("Closing Python")
+                try:
+                    if MAP_METHOD == "global" or MAP_METHOD == "local":
+                        map = publish_voxels(map_object, grid_params['min_bound'], grid_params['max_bound'], grid_params['grid_size'], colors, next_map)
+                        map_pub.publish(map)
+                    elif MAP_METHOD == "local":
+                        map = publish_local_map(map_object.local_map, map_object.centroids, grid_params, colors, next_map)
+                        map_pub.publish(map)
+                except:
+                    exit("Publishing broke")
+            else:
+                pc = map_object.gen_points_loc()
+                if frame_num == 0:
+                    vis.remove_geometry
+
+                else:
+                    vis.remove_geometry(pc_prev)
+                    vis.add_geometry(pc)
+                pc_prev = pc
+
+                vis.poll_events()
+                vis.update_renderer()
 
         if MEAS_RESULT:
             if dataset == "semantic_kitti":
